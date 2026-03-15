@@ -1,0 +1,4 @@
+interface:
+  display_name: "LaTeX Citation Curator"
+  short_description: "Find, verify, and rank citations for LaTeX drafts"
+  default_prompt: "Use $latex-citation-curator to find verified papers and BibTeX entries for citation gaps in my LaTeX draft."
