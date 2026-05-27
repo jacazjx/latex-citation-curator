@@ -1,6 +1,6 @@
 ---
 name: latex-citation-curator
-description: Find, verify, rank, and generate DOI-verified or trusted-source BibTeX citations for LaTeX manuscripts and research-writing workflows. Use when Codex needs to scan `.tex` files or draft prose for citation gaps such as `[cite]`, `[citation needed]`, `\todo{cite}`, or Chinese prompts like `我想找一篇论文来支撑论点`; search for real supporting papers; prefer the last 5 years, CCF A/B venues, JCR Q1/Q2 journals, high impact factor, and strong citation performance; replace preprints with formally published versions; prefer Semantic Scholar authenticated access when the user has a key, but fall back to the free shared flow when they do not; use Google Scholar only as a manual hint fallback; and emit BibTeX with explicit provenance fields.
+description: find, verify, rank, and generate doi-verified or trusted-source bibtex citations for latex manuscripts and research-writing workflows. use when codex needs to scan `.tex` files or draft prose for citation gaps such as `[cite]`, `[citation needed]`, `\todo{cite}`, or chinese prompts like `我想找一篇论文来支撑论点`; search for real supporting papers across semantic scholar, openalex, crossref, dblp, doi resolvers, and cnki for chinese-language scholarship; prefer recent high-quality venues such as ccf a/b, jcr q1/q2, cssci, cscd, and 北大核心 when verified; replace preprints with formally published versions; and emit bibtex with explicit provenance fields.
 ---
 
 # LaTeX Citation Curator
@@ -25,8 +25,9 @@ Require these inputs before claiming a citation is verified:
 - The target research area or venue expectations if the topic is narrow
 - Ask whether the user has a Semantic Scholar API key available
 - Ask whether the project already has one or more `.bib` files that should be treated as local ground truth
+- For Chinese-language claims, ask whether CNKI access through a logged-in browser is available when CNKI-only or CSSCI/北大核心/CSCD evidence is needed
 
-If the user has a key:
+If the user has a Semantic Scholar key:
 
 - use authenticated Semantic Scholar mode
 - persist the key after the first successful authenticated run
@@ -36,7 +37,7 @@ If the user does not have a key:
 
 - continue with the free shared Semantic Scholar pool
 - keep long backoff and retryable shared-mode retries enabled
-- verify accepted papers with OpenAlex, Crossref, DOI resolution, and DBLP when applicable
+- verify accepted papers with OpenAlex, Crossref, DOI resolution, DBLP, and CNKI when applicable
 - do not claim Semantic Scholar authenticated verification happened when it did not
 
 Do not block the workflow solely because the user lacks a key.
@@ -69,7 +70,8 @@ For each claim:
 - Reduce the paragraph to one verifiable statement
 - Extract 3 to 8 search terms: task, method, population, metric, and constraint
 - Generate English keywords even if the draft is in Chinese
-- Keep one short note describing what kind of evidence is needed: benchmark result, survey, causal claim, system design, theory, or dataset paper
+- Generate Chinese keywords too when the claim concerns Chinese context, Chinese policy, Chinese-language scholarship, CNKI-only journals, CSSCI, CSCD, or 北大核心 sources
+- Keep one short note describing what kind of evidence is needed: benchmark result, survey, causal claim, system design, theory, dataset paper, policy evidence, or Chinese empirical study
 
 Prefer direct support over topical similarity.
 
@@ -82,7 +84,8 @@ Use this source order:
 1. Semantic Scholar API and OpenAlex for candidate discovery and metadata cross-checking
 2. Crossref and DOI resolver or publisher landing pages for final DOI confirmation and official metadata
 3. DBLP for computer-science bibliographic records
-4. Google Scholar only as a manual hint source when DOI discovery fails or metadata is sparse
+4. CNKI for Chinese-language scholarship, Chinese journals, CSSCI/CSCD/北大核心 filtering, GB/T 7714/EndNote metadata, and Chinese abstracts or keywords
+5. Google Scholar only as a manual hint source when DOI discovery fails or metadata is sparse
 
 Before remote discovery, scan the local `.bib` files, the project ledger, and the user-level paper library. If a matching entry was already checked, reuse it first instead of re-fetching metadata.
 
@@ -101,11 +104,13 @@ Always collect:
 - venue
 - DOI when available
 - abstract or summary
-- citation count
+- citation count when the source exposes it
 - source URL
-- BibTeX source URL if available
+- BibTeX, EndNote, RIS, or GB/T 7714 source URL/provider when available
 
 Read [references/source-verification.md](references/source-verification.md) when you need the exact verification checklist or BibTeX provenance rules.
+
+Read [references/cnki-workflow.md](references/cnki-workflow.md) when the task needs CNKI search, CNKI metadata extraction, CNKI source-category filters, or Chinese citation export handling.
 
 ### 5. Replace preprints with the final published version
 
@@ -115,11 +120,13 @@ If a preprint has a formally published version:
 
 - Cite the formal version
 - Use the formal DOI when one exists
-- If the formal version has no DOI, fetch BibTeX from DBLP or another reliable provider and mark the entry for manual second checking
+- If the formal version has no DOI, fetch BibTeX from DBLP, CNKI export metadata, or another reliable provider and mark the entry for manual second checking
 - Prefer publisher or Crossref metadata over preprint metadata
 - Keep the preprint only as a search breadcrumb in your notes, not in the final bibliography
 
 If you cannot prove that a formal version exists, say so explicitly.
+
+For Chinese journal articles with no DOI, treat CNKI as discovery and metadata evidence. Do not call the result DOI-verified. Emit a trusted-source entry only when the CNKI record is coherent, the journal/source is formal, and the citation metadata came from CNKI export or another trusted provider.
 
 ### 6. Rank candidates with a repeatable score
 
@@ -140,6 +147,8 @@ Treat the score as a ranking aid, not as proof. A lower-scoring paper that direc
 
 Apply a minimum relevance gate before delivery. If no candidate clears the gate, return no final citation rather than a weakly related paper.
 
+For CNKI candidates, use CSSCI, CSCD, 北大核心, SCI, or EI source-category evidence as venue-quality hints only when observed in CNKI or another source. Do not infer these labels from journal reputation alone.
+
 ### 7. Produce verified output
 
 For each accepted citation, provide:
@@ -149,7 +158,7 @@ For each accepted citation, provide:
 - DOI when verified, or an explicit note that no DOI was found for the formal version
 - venue and year
 - a brief explanation of why the paper supports the claim
-- any caveat, such as the paper being older but seminal
+- any caveat, such as the paper being older but seminal or CNKI-only metadata requiring manual second check
 - a manual-check note when the final BibTeX came from a trusted provider without a DOI
 
 When generating BibTeX, include provenance fields such as:
@@ -175,15 +184,17 @@ After every run:
 
 ## Hard Rules
 
-- Do not invent papers, DOIs, venues, citation counts, quartiles, or impact factors.
+- Do not invent papers, DOIs, venues, citation counts, quartiles, source-category labels, or impact factors.
 - Do not claim authenticated Semantic Scholar verification when no valid user key was used.
+- Do not claim CNKI verification unless CNKI was actually searched or a CNKI record/export supplied the metadata.
+- Do not bypass CNKI login, paywalls, download restrictions, or captchas. If CNKI shows a visible captcha, pause and ask the user to complete it manually.
 - Do not keep a preprint in the final bibliography when a verified formal publication exists.
 - If a formal version has a DOI, verify and use it.
-- If a formal version has no DOI, only emit BibTeX from a trusted provider such as DBLP and mark the result for manual second checking.
+- If a formal version has no DOI, only emit BibTeX from a trusted provider such as DBLP, CNKI export metadata, or another reliable source and mark the result for manual second checking.
 - Do not use Google Scholar as an automated metadata or BibTeX source.
 - Do not overwrite user-authored `.bib` entries just to inject verification metadata. Store extra state in the project ledger unless the user explicitly asks for BibTeX rewrites.
-- Do not guess CCF tier or JCR quartile. Mark them as unknown when you cannot verify them.
-- Do not hide uncertainty. Surface disagreements between DBLP, Crossref, Semantic Scholar, and publisher pages.
+- Do not guess CCF tier, JCR quartile, CSSCI, CSCD, or 北大核心 status. Mark them as unknown when you cannot verify them.
+- Do not hide uncertainty. Surface disagreements between DBLP, Crossref, Semantic Scholar, OpenAlex, CNKI, and publisher pages.
 
 ## Local Helpers
 
@@ -287,7 +298,7 @@ Provide `--venue-hints venue-hints.json` when you have curated CCF/JCR/IF mappin
 ## Exception Handling
 
 - Allow older papers when they are seminal, standards-defining, or required to explain a classic method. Label them as a `seminal exception`.
-- Allow a non-CCF or non-JCR venue when the field is interdisciplinary and the paper is otherwise strongly supported by DOI, citation performance, and direct relevance.
+- Allow a non-CCF, non-JCR, or non-CNKI-indexed venue when the field is interdisciplinary and the paper is otherwise strongly supported by DOI, citation performance, and direct relevance.
 - If only preprints exist and the user explicitly allows them, keep them outside the final verified bibliography or label them as `fallback preprint` instead of `verified final citation`.
 
 ## Recommended Optimizations
@@ -300,8 +311,10 @@ Apply these improvements when the task is large:
 - Keep a field-specific venue allowlist when the manuscript repeatedly targets the same subdomain.
 - Detect duplicate DOIs before appending new BibTeX entries.
 - Detect duplicate BibTeX keys when DOI is unavailable.
+- For Chinese claims, run one broad Chinese CNKI query before deep per-claim searches so shared Chinese terms, authors, and journals can be reused.
 
 ## References
 
 - Read [references/quality-scoring.md](references/quality-scoring.md) for the scoring formula and tie-break rules.
-- Read [references/source-verification.md](references/source-verification.md) for DOI checks, preprint replacement, and BibTeX provenance requirements.
+- Read [references/source-verification.md](references/source-verification.md) for DOI checks, preprint replacement, CNKI provenance handling, and BibTeX provenance requirements.
+- Read [references/cnki-workflow.md](references/cnki-workflow.md) for CNKI search, advanced filters, result parsing, detail-page metadata, captcha handling, and export-provider rules.
