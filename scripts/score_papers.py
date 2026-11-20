@@ -10,6 +10,8 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from verification import apply_checks
+
 CCF_SCORES = {"A": 35.0, "B": 28.0, "C": 18.0}
 JCR_SCORES = {"Q1": 30.0, "Q2": 22.0, "Q3": 14.0, "Q4": 8.0}
 
@@ -98,6 +100,7 @@ def compute_scores(
     current_year: int,
     allow_preprint: bool,
 ) -> dict[str, object]:
+    record = apply_checks(dict(record))
     year = parse_int(record, "year")
     citation_count = parse_int(record, "citationCount")
     impact_factor = parse_float(record, "impactFactor")
@@ -129,13 +132,15 @@ def compute_scores(
 
     impact_score = min(15.0, 6.0 * math.log10(1.0 + impact_factor))
     publication_bonus = 0.0
-    if source and source_url and not preprint:
+    if record["metadataVerified"] and source and source_url and not preprint:
         if doi:
             publication_bonus = 5.0
         elif reliable_bibtex_source:
             publication_bonus = 3.0
 
     rejection_reasons: list[str] = []
+    if not record["metadataVerified"]:
+        rejection_reasons.append("metadata-checks-not-passed:" + ",".join(record["unresolvedFields"]))
     if not doi and not reliable_bibtex_source:
         rejection_reasons.append("missing-doi-and-no-trusted-bibtex-source")
     if not source or not source_url:
@@ -177,6 +182,8 @@ def compute_scores(
 def render_tsv(records: list[dict[str, object]]) -> str:
     headers = [
         "eligible",
+        "verificationStatus",
+        "unresolvedFields",
         "qualityScore",
         "title",
         "year",

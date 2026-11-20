@@ -16,6 +16,8 @@
 
 ## Formula
 
+The shared field checker determines verified eligibility before scoring. Scores cannot override failed, missing, insufficient or conflicting checks.
+
 Use this formula to rank candidates after collecting real metadata:
 
 ```text
@@ -122,7 +124,7 @@ If impact factor is unavailable or not meaningful for the venue type, use `0`.
 
 ## Relevance and Evidence
 
-Assign these manually after reading the abstract, metadata, and if necessary the paper landing page.
+For considered recommendations, assess these after reading the actual relevant content. The fetch script only estimates them through title/abstract similarity and keywords; its values are explicitly heuristic and never establish claim support. `scoreAssessment` records that limitation and `claimSupport` remains separate.
 
 ### Relevance Score
 
@@ -147,12 +149,12 @@ Score from `0` to `10`.
 Add `5` when all of these are true:
 
 - the paper has a DOI
-- the final published version is verified
+- all required field checks actually passed and formal publication was established
 - provenance is recorded with `source` and `sourceUrl`
 
 Add `3` when all of these are true:
 
-- the final published version has no DOI
+- no DOI was found for the formal version and all required field checks passed
 - BibTeX was downloaded from a trusted provider such as DBLP
 - provenance is recorded with `source` and `sourceUrl`
 
@@ -160,7 +162,9 @@ Otherwise add `0`.
 
 ## Rejection Rules
 
-Reject the candidate from the final verified list when any of these apply:
+Reject from the verified list when any required field check did not pass, including absent corroboration or differing actual BibTeX. Keep those fields and source values in `reviewRequired` and state. Legacy flags/dates do not pass this check.
+
+Also reject when any of these apply:
 
 - DOI is missing and there is no trusted BibTeX provider for the formal version
 - provenance is missing
@@ -169,7 +173,7 @@ Reject the candidate from the final verified list when any of these apply:
 - the record is only a preprint and the user did not explicitly allow fallback preprints
 - the record has no DOI, no trusted-provider BibTeX, and no manual second-check path
 
-Rejected items may remain in an audit trail, but not in the final verified bibliography.
+Attempted rejected items must remain in the report and persistent field records, but not in verified bibliography.
 
 ## Tie-Breaks
 

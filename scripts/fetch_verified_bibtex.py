@@ -18,6 +18,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from score_papers import compute_scores
+from verification import SCHEMA_VERSION, CORE_FIELDS, DETAIL_FIELDS, observation, normalize, present, apply_checks, is_verified, bibtex_field_value, bibtex_entry_key, split_bibtex_entries, parse_bibtex
 
 SEMANTIC_SCHOLAR_FIELDS = ",".join(
     [
@@ -74,7 +75,7 @@ EMPIRICAL_TERMS = {
 }
 
 RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
-TRUSTED_BIBTEX_SOURCES = {"dblp", "doi-content-negotiation"}
+TRUSTED_BIBTEX_SOURCES = {"dblp", "doi-content-negotiation", "cnki-export"}
 LOCAL_REUSE_SOURCES = {"local-bib", "local-ledger", "user-library"}
 
 
@@ -777,6 +778,7 @@ def semantic_scholar_record(raw: dict[str, Any], query: str) -> dict[str, Any]:
         "url": url,
         "paperId": str(raw.get("paperId", "")).strip(),
         "publicationTypes": publication_types,
+        "publicationStatus": "preprint" if preprint else "formal" if any(t in {"JournalArticle", "Conference"} for t in publication_types) and venue else "unknown",
         "peerReviewed": peer_reviewed,
         "preprint": preprint,
         "relevanceScore": infer_relevance_score(query, title, abstract),
@@ -856,6 +858,10 @@ def openalex_record(item: dict[str, Any], query_title: str) -> dict[str, Any]:
         "preprint": preprint,
         "peerReviewed": peer_reviewed,
         "openalexId": normalize_whitespace(str(item.get("id", ""))),
+        "publicationStatus": "preprint" if preprint else "formal" if str(item.get("type_crossref") or item.get("type")) in {"journal-article", "proceedings-article", "article"} and openalex_venue(item) else "unknown",
+        "volume": str((item.get("biblio") or {}).get("volume") or ""),
+        "issue": str((item.get("biblio") or {}).get("issue") or ""),
+        "pages": "-".join(str((item.get("biblio") or {}).get(k) or "") for k in ("first_page", "last_page")).strip("-"),
         "similarity": title_similarity(query_title, title),
         "candidateSource": "openalex",
     }
@@ -878,7 +884,7 @@ def choose_best_openalex(title: str, items: list[dict[str, Any]]) -> dict[str, A
 
 
 def crossref_year(item: dict[str, Any]) -> int:
-    for field in ("published-print", "published-online", "issued", "created"):
+    for field in ("published-print", "published-online", "issued"):
         parts = item.get(field, {}).get("date-parts", [])
         if parts and parts[0]:
             return choose_year(parts[0][0])
@@ -934,6 +940,12 @@ def crossref_record(item: dict[str, Any], query_title: str) -> dict[str, Any]:
         "preprint": preprint,
         "peerReviewed": peer_reviewed,
         "similarity": title_similarity(query_title, title),
+        "publicationStatus": "preprint" if preprint else "formal" if item_type in {"journal-article", "proceedings-article", "book-chapter", "book", "report", "standard"} and venue else "unknown",
+        "volume": str(item.get("volume") or ""),
+        "issue": str(item.get("issue") or ""),
+        "pages": str(item.get("page") or ""),
+        "articleNumber": str(item.get("article-number") or ""),
+        "publicationDates": {k: item[k] for k in ("published-print", "published-online", "issued") if k in item},
     }
 
 
@@ -996,6 +1008,10 @@ def dblp_record(hit: dict[str, Any], title: str) -> dict[str, Any]:
         "preprint": preprint,
         "peerReviewed": not preprint,
         "similarity": title_similarity(title, item_title),
+        "publicationStatus": "preprint" if preprint else "formal" if item_type in {"Journal Articles", "Conference and Workshop Papers", "Books and Theses", "Parts in Books or Collections"} and venue else "unknown",
+        "volume": str(info.get("volume") or ""),
+        "issue": str(info.get("number") or ""),
+        "pages": str(info.get("pages") or ""),
     }
 
 
@@ -1023,15 +1039,22 @@ def candidate_identity(candidate: dict[str, Any]) -> str:
 
 
 def merge_candidates(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    merged: dict[str, dict[str, Any]] = {}
     for candidate in primary + secondary:
         identity = candidate_identity(candidate)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        merged.append(candidate)
-    return merged
+        entry = dict(candidate)
+        snapshots = list(entry.get("candidateObservations", []))
+        source = str(entry.get("candidateSource", ""))
+        if source in {"semantic-scholar", "openalex"}:
+            snapshots.append(observation(source, entry))
+        elif source in LOCAL_REUSE_SOURCES:
+            snapshots.append(observation("local-bib", entry, url=str(entry.get("bibPath", ""))))
+        if identity not in merged:
+            entry["candidateObservations"] = snapshots
+            merged[identity] = entry
+        else:
+            merged[identity].setdefault("candidateObservations", []).extend(snapshots)
+    return list(merged.values())
 
 
 def candidate_passes_relevance_gate(candidate: dict[str, Any], *, min_relevance_score: float) -> bool:
@@ -1071,83 +1094,10 @@ def append_provenance_fields(bibtex: str, fields: dict[str, str]) -> str:
     return entry[:-1].rstrip() + ",\n" + insertion + "\n}\n"
 
 
-def bibtex_entry_key(entry: str) -> str:
-    match = re.search(r"(?is)@\w+\s*\{\s*([^,\s]+)", entry)
-    return normalize_whitespace(match.group(1)) if match else ""
 
 
-def bibtex_field_value(entry: str, field: str) -> str:
-    pattern = re.compile(rf"(?im)\b{re.escape(field)}\b\s*=")
-    match = pattern.search(entry)
-    if not match:
-        return ""
-    index = match.end()
-    length = len(entry)
-    while index < length and entry[index].isspace():
-        index += 1
-    if index >= length:
-        return ""
-    if entry[index] == "{":
-        depth = 0
-        start = index + 1
-        index += 1
-        while index < length:
-            char = entry[index]
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                if depth == 0:
-                    return normalize_whitespace(entry[start:index])
-                depth -= 1
-            index += 1
-        return normalize_whitespace(entry[start:])
-    if entry[index] == '"':
-        start = index + 1
-        index += 1
-        while index < length:
-            char = entry[index]
-            if char == '"' and entry[index - 1] != "\\":
-                return normalize_whitespace(entry[start:index])
-            index += 1
-        return normalize_whitespace(entry[start:])
-    start = index
-    while index < length and entry[index] not in {",", "\n"}:
-        index += 1
-    return normalize_whitespace(entry[start:index])
 
 
-def split_bibtex_entries(text: str) -> list[str]:
-    entries: list[str] = []
-    start = None
-    depth = 0
-    in_quote = False
-    escape = False
-    for index, char in enumerate(text):
-        if start is None:
-            if char == "@":
-                start = index
-                depth = 0
-                in_quote = False
-                escape = False
-            continue
-        if in_quote:
-            if char == '"' and not escape:
-                in_quote = False
-            escape = char == "\\" and not escape
-            continue
-        if char == '"' and (index == 0 or text[index - 1] != "\\"):
-            in_quote = True
-            escape = False
-            continue
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth = max(0, depth - 1)
-            if depth == 0:
-                entries.append(text[start : index + 1].strip() + "\n")
-                start = None
-        escape = False
-    return entries
 
 
 def ledger_identity(record: dict[str, Any]) -> str:
@@ -1164,13 +1114,7 @@ def ledger_identity(record: dict[str, Any]) -> str:
 
 
 def infer_local_checked_status(entry: dict[str, Any]) -> bool:
-    verification_status = str(entry.get("verificationStatus", "")).strip()
-    verified_at = str(entry.get("verifiedAt", "")).strip()
-    return bool(
-        verification_status in {"verified-doi", "trusted-bibtex-no-doi"}
-        or verified_at
-        or entry.get("manualCheckRequired")
-    )
+    return is_verified(entry)
 
 
 def merge_record_values(base: dict[str, Any], overlay: dict[str, Any], fields: list[str]) -> None:
@@ -1224,6 +1168,11 @@ def parse_local_bib_entry(entry: str, bib_path: Path) -> dict[str, Any]:
         "qualityScore": quality_score,
         "reliableBibtexSource": source if source in TRUSTED_BIBTEX_SOURCES else "",
         "candidateSource": "local-bib",
+        "volume": bibtex_field_value(entry, "volume"),
+        "issue": bibtex_field_value(entry, "number"),
+        "pages": bibtex_field_value(entry, "pages"),
+        "articleNumber": bibtex_field_value(entry, "eid") or bibtex_field_value(entry, "article-number"),
+        "publicationStatus": "formal" if re.match(r"(?i)@(article|inproceedings|proceedings|book|incollection)\b", entry.strip()) else "unknown",
     }
     preprint = infer_preprint(venue, url, [], {"ArXiv": bool(re.search(r"arxiv", url, flags=re.IGNORECASE))})
     item["preprint"] = preprint
@@ -1232,166 +1181,69 @@ def parse_local_bib_entry(entry: str, bib_path: Path) -> dict[str, Any]:
     return item
 
 
+
+def bibtex_metadata(text: str) -> dict[str, Any]:
+    return parse_bibtex(text)
+
+
+def merge_verification_record(existing: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    merged.update(record)
+    if "metadataObservations" not in record and existing.get("metadataObservations"):
+        merged["metadataObservations"] = existing["metadataObservations"]
+    if record.get("bibtex"):
+        merged["bibtexMetadata"] = bibtex_metadata(str(record["bibtex"]))
+    if merged.get("verificationStatus") and not merged.get("metadataObservations"):
+        merged["legacyVerificationStatus"] = merged["verificationStatus"]
+    return apply_checks(merged)
+
+
 def update_ledger_entry(
-    ledger: dict[str, Any],
-    record: dict[str, Any],
-    *,
-    bib_path: Path | None = None,
-    checked_override: bool | None = None,
+    ledger: dict[str, Any], record: dict[str, Any], *,
+    bib_path: Path | None = None, checked_override: bool | None = None,
 ) -> None:
     identity = ledger_identity(record)
     if not identity:
         return
     entries = ledger.setdefault("entries", {})
-    existing = entries.get(identity, {}) if isinstance(entries.get(identity), dict) else {}
-    merged = dict(existing)
-    merge_record_values(
-        merged,
-        record,
-        [
-            "bibtexKey",
-            "title",
-            "year",
-            "venue",
-            "doi",
-            "url",
-            "source",
-            "sourceUrl",
-            "verificationStatus",
-            "verifiedAt",
-            "qualityScore",
-            "reliableBibtexSource",
-            "googleScholarSearchUrl",
-            "bibtex",
-            "peerReviewed",
-            "preprint",
-        ],
-    )
-    if record.get("authors"):
-        merged["authors"] = list(record.get("authors", []))
-    if record.get("verificationSources"):
-        merged["verificationSources"] = list(record.get("verificationSources", []))
-    manual_reasons = record.get("manualCheckReasons") or []
-    if manual_reasons:
-        merged["manualCheckReasons"] = list(manual_reasons)
-    merged["manualCheckRequired"] = bool(record.get("manualCheckRequired") or merged.get("manualCheckRequired"))
-    merged["checked"] = bool(
-        infer_local_checked_status(record)
-        if checked_override is None
-        else checked_override
-    ) or bool(merged.get("checked"))
+    merged = merge_verification_record(entries.get(identity, {}), record)
     merged["lastSeenAt"] = current_date_iso()
-    bib_paths = set(str(path) for path in merged.get("bibPaths", []) if path)
+    paths = set(merged.get("bibPaths", []))
     if bib_path is not None:
-        bib_paths.add(str(bib_path.resolve()))
-    merged["bibPaths"] = sorted(bib_paths)
+        paths.add(str(bib_path.resolve()))
+    merged["bibPaths"] = sorted(paths)
     entries[identity] = merged
 
 
-def update_user_library_entry(
-    library: dict[str, Any],
-    record: dict[str, Any],
-    *,
-    project_root: Path | None = None,
-) -> None:
+def update_user_library_entry(library: dict[str, Any], record: dict[str, Any], *, project_root: Path | None = None) -> None:
     identity = ledger_identity(record)
     if not identity:
         return
     entries = library.setdefault("entries", {})
-    existing = entries.get(identity, {}) if isinstance(entries.get(identity), dict) else {}
-    merged = dict(existing)
-    merge_record_values(
-        merged,
-        record,
-        [
-            "bibtexKey",
-            "title",
-            "year",
-            "venue",
-            "doi",
-            "url",
-            "source",
-            "sourceUrl",
-            "verificationStatus",
-            "verifiedAt",
-            "qualityScore",
-            "reliableBibtexSource",
-            "googleScholarSearchUrl",
-            "bibtex",
-            "peerReviewed",
-            "preprint",
-        ],
-    )
-    if record.get("authors"):
-        merged["authors"] = list(record.get("authors", []))
-    if record.get("verificationSources"):
-        merged["verificationSources"] = list(record.get("verificationSources", []))
-    if record.get("manualCheckReasons"):
-        merged["manualCheckReasons"] = list(record.get("manualCheckReasons", []))
-    merged["manualCheckRequired"] = bool(record.get("manualCheckRequired") or merged.get("manualCheckRequired"))
-    merged["checked"] = bool(infer_local_checked_status(record) or merged.get("checked"))
+    merged = merge_verification_record(entries.get(identity, {}), record)
     merged["lastUsedAt"] = current_date_iso()
-    projects = set(str(path) for path in merged.get("projectRoots", []) if path)
+    roots = set(merged.get("projectRoots", []))
     if project_root is not None:
-        projects.add(str(project_root.resolve()))
-    merged["projectRoots"] = sorted(projects)
+        roots.add(str(project_root.resolve()))
+    merged["projectRoots"] = sorted(roots)
     entries[identity] = merged
 
 
-def sync_local_bib_entries(
-    bib_paths: list[Path],
-    ledger: dict[str, Any],
-) -> list[dict[str, Any]]:
-    parsed_entries: list[dict[str, Any]] = []
-    bib_files = ledger.setdefault("bibFiles", {})
+def sync_local_bib_entries(bib_paths: list[Path], ledger: dict[str, Any]) -> list[dict[str, Any]]:
+    parsed_entries = []
     for bib_path in bib_paths:
         resolved = bib_path.resolve()
         if not resolved.exists():
             continue
-        text = resolved.read_text(encoding="utf-8")
-        file_entries = [parse_local_bib_entry(entry, resolved) for entry in split_bibtex_entries(text)]
-        parsed_entries.extend(file_entries)
-        bib_files[str(resolved)] = {
-            "lastSyncedAt": current_date_iso(),
-            "entryCount": len(file_entries),
-        }
-        for entry in file_entries:
-            update_ledger_entry(ledger, entry, bib_path=resolved)
-
-    merged_entries: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for entry in parsed_entries:
-        identity = ledger_identity(entry)
-        if not identity or identity in seen:
-            continue
-        seen.add(identity)
-        ledger_entry = ledger.get("entries", {}).get(identity, {})
-        merged = dict(entry)
-        if isinstance(ledger_entry, dict):
-            merge_record_values(
-                merged,
-                ledger_entry,
-                [
-                    "source",
-                    "sourceUrl",
-                    "verificationStatus",
-                    "verifiedAt",
-                    "qualityScore",
-                    "reliableBibtexSource",
-                    "googleScholarSearchUrl",
-                    "bibtex",
-                ],
-            )
-            if ledger_entry.get("verificationSources"):
-                merged["verificationSources"] = list(ledger_entry.get("verificationSources", []))
-            if ledger_entry.get("manualCheckReasons"):
-                merged["manualCheckReasons"] = list(ledger_entry.get("manualCheckReasons", []))
-            merged["manualCheckRequired"] = bool(
-                merged.get("manualCheckRequired") or ledger_entry.get("manualCheckRequired")
-            )
-            merged["checked"] = bool(ledger_entry.get("checked") or merged.get("checked"))
-        merged_entries.append(merged)
-    return merged_entries
+        items = [parse_local_bib_entry(entry, resolved) for entry in split_bibtex_entries(resolved.read_text(encoding="utf-8"))]
+        ledger.setdefault("bibFiles", {})[str(resolved)] = {"lastSyncedAt": current_date_iso(), "entryCount": len(items)}
+        for item in items:
+            update_ledger_entry(ledger, item, bib_path=resolved)
+            # Each file's current content is checked separately, including duplicate DOIs.
+            merged = merge_verification_record(ledger["entries"][ledger_identity(item)], item)
+            merged["candidateSource"] = "local-bib"
+            parsed_entries.append(merged)
+    return parsed_entries
 
 
 def ledger_search_entries(ledger: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1408,7 +1260,7 @@ def ledger_search_entries(ledger: dict[str, Any]) -> list[dict[str, Any]]:
         entry["candidateSource"] = "local-ledger"
         entry["peerReviewed"] = bool(entry.get("peerReviewed", not entry.get("preprint", False)))
         entry["preprint"] = bool(entry.get("preprint", False))
-        entry["checked"] = bool(entry.get("checked") or infer_local_checked_status(entry))
+        entry = apply_checks(entry)
         entry["verificationSources"] = list(entry.get("verificationSources", []))
         entry["manualCheckReasons"] = list(entry.get("manualCheckReasons", []))
         results.append(entry)
@@ -1430,7 +1282,7 @@ def user_library_search_entries(library: dict[str, Any]) -> list[dict[str, Any]]
         entry["candidateSource"] = "user-library"
         entry["peerReviewed"] = bool(entry.get("peerReviewed", not entry.get("preprint", False)))
         entry["preprint"] = bool(entry.get("preprint", False))
-        entry["checked"] = bool(entry.get("checked") or infer_local_checked_status(entry))
+        entry = apply_checks(entry)
         entry["verificationSources"] = list(entry.get("verificationSources", []))
         entry["manualCheckReasons"] = list(entry.get("manualCheckReasons", []))
         results.append(entry)
@@ -1467,266 +1319,155 @@ def search_local_bib_candidates(
     return ranked
 
 
-def build_scored_local_result(
-    candidate: dict[str, Any],
-    *,
-    query: str,
-    allow_preprint: bool,
-    venue_hints: dict[str, Any],
-) -> dict[str, Any]:
+def build_scored_local_result(candidate: dict[str, Any], *, query: str, allow_preprint: bool, venue_hints: dict[str, Any]) -> dict[str, Any]:
     result = dict(candidate)
+    result["metadataObservations"] = list(result.get("metadataObservations", [])) + list(result.get("candidateObservations", []))
+    result["bibtexMetadata"] = bibtex_metadata(str(result.get("bibtex", "")))
+    apply_checks(result)
     apply_venue_hints(result, venue_hints)
-    result["relevanceScore"] = infer_relevance_score(query, str(result.get("title", "")), "")
-    result["evidenceScore"] = infer_evidence_score(
-        str(result.get("title", "")),
-        "",
-        bool(result.get("peerReviewed", False)),
-    )
-    if result.get("source") in TRUSTED_BIBTEX_SOURCES:
-        result["reliableBibtexSource"] = result["source"]
-    result["googleScholarSearchUrl"] = result.get("googleScholarSearchUrl") or google_scholar_search_url(
-        str(result.get("title", "")) or query
-    )
-    scored = compute_scores(result, datetime.now(UTC).year, allow_preprint)
-    scored["verificationSources"] = list(result.get("verificationSources", []))
-    scored["notes"] = [f"reused-{result.get('candidateSource', 'local-cache')}-entry"]
-    scored["manualCheckRequired"] = bool(result.get("manualCheckRequired"))
-    scored["manualCheckReasons"] = list(result.get("manualCheckReasons", []))
-    scored["googleScholarSearchUrl"] = str(result.get("googleScholarSearchUrl", ""))
-    scored["verificationStatus"] = str(
-        result.get("verificationStatus")
-        or ("verified-doi" if scored.get("doi") else "trusted-bibtex-no-doi")
-    )
-    scored["bibtex"] = str(result.get("bibtex", ""))
-    return scored
+    result["relevanceScore"] = infer_relevance_score(query, str(result.get("title", "")), str(result.get("abstract", "")))
+    result["evidenceScore"] = infer_evidence_score(str(result.get("title", "")), str(result.get("abstract", "")), bool(result.get("peerReviewed")))
+    result["claimSupport"] = {"status": "not-reviewed", "reason": "Claim support must be reviewed for this query."}
+    result["notes"] = ["rechecked-stored-field-evidence"]
+    return compute_scores(result, datetime.now(UTC).year, allow_preprint)
 
 
-def replace_with_formal_version(
-    result: dict[str, Any],
-    formal_meta: dict[str, Any],
-    *,
-    source_name: str,
-    notes: list[str],
-) -> bool:
-    if not result.get("preprint") or formal_meta.get("preprint"):
+def replace_with_formal_version(result: dict[str, Any], formal_meta: dict[str, Any], *, source_name: str, notes: list[str]) -> bool:
+    if not result.get("preprint") or formal_meta.get("publicationStatus") != "formal":
+        return False
+    if normalize(result.get("title"), "title") != normalize(formal_meta.get("title"), "title"):
+        return False
+    if not result.get("authors") or normalize(result["authors"], "authors") != normalize(formal_meta.get("authors"), "authors"):
         return False
     result["hasFormalVersion"] = True
     result["preprint"] = False
     result["peerReviewed"] = True
-    for field in ("title", "abstract", "year", "venue", "doi", "url"):
-        if formal_meta.get(field):
-            result[field] = formal_meta[field]
-    if formal_meta.get("authors"):
-        result["authors"] = formal_meta["authors"]
-    if formal_meta.get("dblpUrl"):
-        result["dblpUrl"] = formal_meta["dblpUrl"]
-    if formal_meta.get("bibtexUrl"):
-        result["bibtexUrl"] = formal_meta["bibtexUrl"]
-    notes.append(f"preprint-replaced-with-{source_name}-formal-version")
-    if not formal_meta.get("doi"):
-        notes.append(f"formal-version-from-{source_name}-has-no-doi")
+    for field in CORE_FIELDS + ("doi", "url", "abstract") + DETAIL_FIELDS:
+        result[field] = formal_meta.get(field, "")
+    notes.append(f"preprint-replaced-with-{source_name}-formal-version; matching title and ordered authors")
     return True
 
 
 def enrich_with_verified_metadata(
-    candidate: dict[str, Any],
-    *,
-    query: str,
-    user_agent: str,
-    crossref_limit: int,
-    dblp_limit: int,
-    openalex_limit: int,
-    crossref_mailto: str | None,
-    allow_preprint: bool,
-    venue_hints: dict[str, Any],
+    candidate: dict[str, Any], *, query: str, user_agent: str,
+    crossref_limit: int, dblp_limit: int, openalex_limit: int,
+    crossref_mailto: str | None, allow_preprint: bool, venue_hints: dict[str, Any],
 ) -> dict[str, Any]:
     result = dict(candidate)
-    provenance_chain = [str(result.get("candidateSource", "semantic-scholar"))]
     notes: list[str] = []
-    manual_check_reasons: list[str] = []
-    crossref_meta: dict[str, Any] | None = None
-    openalex_meta: dict[str, Any] | None = None
-    dblp_meta: dict[str, Any] | None = None
+    errors: list[dict[str, str]] = []
+    snapshots = list(candidate.get("candidateObservations", []))
+    source = str(candidate.get("candidateSource", ""))
+    if source in {"semantic-scholar", "openalex"}:
+        snapshots.append(observation(source, candidate))
+    elif source in LOCAL_REUSE_SOURCES:
+        snapshots.append(observation("local-bib", candidate, url=str(candidate.get("bibPath", ""))))
+    found: list[tuple[str, dict[str, Any]]] = []
 
-    doi = str(result.get("doi", "")).strip()
+    def fetch(source_name, action):
+        try:
+            return action()
+        except FetchError as exc:
+            errors.append({"source": source_name, "error": str(exc)})
+            return None
+
+    doi = normalize_doi(str(result.get("doi", "")))
     if doi:
-        try:
-            crossref_payload = crossref_lookup_doi(doi, user_agent=user_agent)
-            if crossref_payload:
-                crossref_meta = crossref_record(crossref_payload, result["title"])
-                provenance_chain.append("crossref")
-        except FetchError as exc:
-            notes.append(f"crossref-doi-lookup-failed: {exc}")
-
-        try:
-            openalex_payload = openalex_lookup_doi(doi, user_agent=user_agent, mailto=crossref_mailto)
-            if openalex_payload:
-                openalex_meta = openalex_record(openalex_payload, result["title"])
-                if "openalex" not in provenance_chain:
-                    provenance_chain.append("openalex")
-        except FetchError as exc:
-            notes.append(f"openalex-doi-lookup-failed: {exc}")
-
-    if not crossref_meta or crossref_meta["preprint"] or not crossref_meta.get("doi"):
-        try:
-            crossref_candidates = crossref_search_title(
-                result["title"],
-                limit=crossref_limit,
-                user_agent=user_agent,
-                mailto=crossref_mailto,
-            )
-            chosen = choose_best_crossref(result["title"], crossref_candidates)
-            if chosen:
-                if "crossref" not in provenance_chain:
-                    provenance_chain.append("crossref")
-                crossref_meta = chosen
-        except FetchError as exc:
-            notes.append(f"crossref-title-search-failed: {exc}")
-
-    if openalex_limit > 0 and (not openalex_meta or result.get("preprint") or not openalex_meta.get("doi")):
-        try:
-            openalex_candidates = openalex_search_title(
-                result["title"],
-                limit=openalex_limit,
-                user_agent=user_agent,
-                mailto=crossref_mailto,
-                require_doi=False,
-            )
-            chosen_openalex = choose_best_openalex(result["title"], openalex_candidates)
-            if chosen_openalex:
-                openalex_meta = chosen_openalex
-                if "openalex" not in provenance_chain:
-                    provenance_chain.append("openalex")
-        except FetchError as exc:
-            notes.append(f"openalex-title-search-failed: {exc}")
-
-    if crossref_meta:
-        if not replace_with_formal_version(result, crossref_meta, source_name="crossref", notes=notes):
-            merge_missing_fields(result, crossref_meta, ["doi", "year", "venue", "abstract", "url"])
-            if crossref_meta.get("authors"):
-                result["authors"] = crossref_meta["authors"]
-            if title_similarity(result["title"], crossref_meta["title"]) >= 0.8:
-                result["title"] = crossref_meta["title"]
-
-    if openalex_meta:
-        if replace_with_formal_version(result, openalex_meta, source_name="openalex", notes=notes):
-            pass
-        merge_missing_fields(result, openalex_meta, ["doi", "year", "venue", "abstract", "url", "citationCount"])
-        if openalex_meta.get("authors"):
-            result["authors"] = result.get("authors") or openalex_meta["authors"]
-        if title_similarity(result["title"], openalex_meta["title"]) >= 0.8:
-            result["title"] = openalex_meta["title"]
-        if openalex_meta.get("openalexId"):
-            result["openalexId"] = openalex_meta["openalexId"]
-
+        payload = fetch("crossref", lambda: crossref_lookup_doi(doi, user_agent=user_agent))
+        if payload:
+            found.append(("crossref", crossref_record(payload, result["title"])))
+    if not any(s == "crossref" for s, _ in found) or result.get("preprint"):
+        payload = fetch("crossref", lambda: crossref_search_title(result["title"], limit=crossref_limit, user_agent=user_agent, mailto=crossref_mailto))
+        selected = choose_best_crossref(result["title"], payload or [])
+        if selected:
+            found.append(("crossref", selected))
+    if openalex_limit > 0:
+        payload = fetch("openalex", lambda: openalex_lookup_doi(doi, user_agent=user_agent, mailto=crossref_mailto)) if doi else None
+        selected = openalex_record(payload, result["title"]) if payload else None
+        if not selected or result.get("preprint"):
+            payload = fetch("openalex", lambda: openalex_search_title(result["title"], limit=openalex_limit, user_agent=user_agent, mailto=crossref_mailto, require_doi=False))
+            selected = choose_best_openalex(result["title"], payload or [])
+        if selected:
+            found.append(("openalex", selected))
+    dblp_meta = None
     if dblp_limit > 0:
-        try:
-            dblp_candidates = dblp_search_title(result["title"], limit=dblp_limit, user_agent=user_agent)
-            dblp_meta = choose_best_dblp(result["title"], dblp_candidates)
-            if dblp_meta:
-                if "dblp" not in provenance_chain:
-                    provenance_chain.append("dblp")
-                replace_with_formal_version(result, dblp_meta, source_name="dblp", notes=notes)
-                merge_missing_fields(result, dblp_meta, ["year", "venue", "doi"])
-                if dblp_meta.get("authors"):
-                    result["authors"] = result.get("authors") or dblp_meta["authors"]
-                if title_similarity(result["title"], dblp_meta["title"]) >= 0.8:
-                    result["title"] = dblp_meta["title"]
-                result["dblpUrl"] = dblp_meta.get("url", "")
-                result["dblpBibtexUrl"] = dblp_meta.get("bibtexUrl", "")
-        except FetchError as exc:
-            notes.append(f"dblp-search-failed: {exc}")
+        payload = fetch("dblp", lambda: dblp_search_title(result["title"], limit=dblp_limit, user_agent=user_agent))
+        dblp_meta = choose_best_dblp(result["title"], payload or [])
+        if dblp_meta:
+            found.append(("dblp", dblp_meta))
 
-    apply_venue_hints(result, venue_hints)
-
-    result["relevanceScore"] = infer_relevance_score(query, result["title"], str(result.get("abstract", "")))
-    result["evidenceScore"] = infer_evidence_score(
-        result["title"],
-        str(result.get("abstract", "")),
-        bool(result.get("peerReviewed", False)),
-    )
+    original = dict(result)
+    for source_name, meta in found:
+        if replace_with_formal_version(result, meta, source_name=source_name, notes=notes):
+            result["preprintBreadcrumb"] = observation(source or "discovery", original)
+            # The superseded preprint is retained separately, not compared as the final edition.
+            snapshots = [o for o in snapshots if o.get("values", {}).get("publicationStatus") != "preprint"]
+            break
+    for source_name, meta in found:
+        if result.get("hasFormalVersion") and meta.get("publicationStatus") == "preprint":
+            continue
+        snapshots.append(observation(source_name, meta))
+        # Select missing values only; disagreeing values stay visible in observations.
+        if result.get("publicationStatus") == "unknown":
+            result["publicationStatus"] = ""
+        merge_missing_fields(result, meta, list(CORE_FIELDS + ("doi", "url", "abstract", "citationCount") + DETAIL_FIELDS))
+        if source_name == "crossref":
+            result["publicationDates"] = meta.get("publicationDates", {})
 
     bibtex = ""
-    bibtex_source = ""
-    bibtex_source_url = ""
+    bib_source = ""
+    bib_url = ""
+    resolution = {"passed": False, "requestedDoi": str(result.get("doi", ""))}
     if result.get("doi"):
-        try:
-            bibtex = doi_bibtex_lookup(str(result["doi"]), user_agent=user_agent)
-            bibtex_source = "doi-content-negotiation"
-            bibtex_source_url = f"https://doi.org/{result['doi']}"
-        except FetchError as exc:
-            notes.append(f"doi-bibtex-fetch-failed: {exc}")
-
-    if not bibtex and dblp_meta and not result.get("preprint") and dblp_meta.get("bibtexUrl"):
-        try:
-            bibtex = dblp_bibtex_lookup(str(dblp_meta["bibtexUrl"]), user_agent=user_agent)
-            bibtex_source = "dblp"
-            bibtex_source_url = str(dblp_meta["bibtexUrl"])
-            if not result.get("doi"):
-                manual_check_reasons.append("formal-version-has-no-doi; bibtex-downloaded-from-dblp")
-                notes.append("manual-second-check-required")
-        except FetchError as exc:
-            notes.append(f"dblp-bibtex-fetch-failed: {exc}")
-
-    if not bibtex_source:
-        if result.get("doi"):
-            bibtex_source = "doi-content-negotiation"
-            bibtex_source_url = f"https://doi.org/{result['doi']}"
-        elif dblp_meta and dblp_meta.get("bibtexUrl"):
-            bibtex_source = "dblp"
-            bibtex_source_url = str(dblp_meta["bibtexUrl"])
-        else:
-            bibtex_source = str(result.get("candidateSource", "semantic-scholar"))
-            bibtex_source_url = str(result.get("semanticScholarUrl", "") or result.get("url", ""))
-
-    result["source"] = bibtex_source
-    result["sourceUrl"] = bibtex_source_url
-    if bibtex_source in TRUSTED_BIBTEX_SOURCES:
-        result["reliableBibtexSource"] = bibtex_source
-    result["manualCheckRequired"] = bool(manual_check_reasons)
-    result["manualCheckReasons"] = manual_check_reasons
+        downloaded = fetch("doi-content-negotiation", lambda: doi_bibtex_lookup(str(result["doi"]), user_agent=user_agent))
+        if downloaded:
+            bibtex = downloaded
+            bib_source = "doi-content-negotiation"
+            bib_url = f"https://doi.org/{result['doi']}"
+            resolved = bibtex_metadata(bibtex)
+            resolution["returnedDoi"] = resolved.get("doi", "")
+            resolution["passed"] = bool(resolved.get("doi") and normalize(resolved["doi"], "doi") == normalize(result["doi"], "doi"))
+            resolution["sourceUrl"] = bib_url
+    if not bibtex and dblp_meta and dblp_meta.get("bibtexUrl"):
+        downloaded = fetch("dblp", lambda: dblp_bibtex_lookup(str(dblp_meta["bibtexUrl"]), user_agent=user_agent))
+        if downloaded:
+            bibtex, bib_source, bib_url = downloaded, "dblp", str(dblp_meta["bibtexUrl"])
+    # Existing user BibTeX must pass checks itself; do not silently repair it with a different export.
+    if candidate.get("candidateSource") in LOCAL_REUSE_SOURCES and candidate.get("bibtex"):
+        if bibtex:
+            exported = observation(bib_source, bibtex_metadata(bibtex), url=bib_url)
+            exported["role"] = "bibliography"
+            snapshots.append(exported)
+        bibtex = str(candidate["bibtex"])
+        bib_source = "local-bib"
+        bib_url = str(candidate.get("bibPath") or candidate.get("sourceUrl") or "local-bib")
+    result.update(bibtex=bibtex, source=bib_source, sourceUrl=bib_url,
+                  bibtexMetadata=bibtex_metadata(bibtex), doiResolution=resolution,
+                  verificationErrors=errors, metadataObservations=snapshots, notes=notes)
+    if bibtex and bib_source != "local-bib":
+        exported = observation(bib_source, result["bibtexMetadata"], url=bib_url)
+        exported["role"] = "bibliography"
+        snapshots.append(exported)
+    result["verificationSources"] = sorted({o["source"] for o in snapshots})
+    result["reliableBibtexSource"] = next((o["source"] for o in snapshots if o.get("role") == "bibliography" and o["source"] in TRUSTED_BIBTEX_SOURCES), "")
+    result["relevanceScore"] = infer_relevance_score(query, str(result.get("title", "")), str(result.get("abstract", "")))
+    result["evidenceScore"] = infer_evidence_score(str(result.get("title", "")), str(result.get("abstract", "")), bool(result.get("peerReviewed")))
+    result["claimSupport"] = {"status": "not-reviewed", "reason": "Metadata checks and heuristic scores do not establish claim support."}
+    apply_checks(result)
+    apply_venue_hints(result, venue_hints)
+    result["verifiedAt"] = current_date_iso() if result["metadataVerified"] else ""
     result["googleScholarSearchUrl"] = google_scholar_search_url(str(result.get("title", "")) or query)
-
     scored = compute_scores(result, datetime.now(UTC).year, allow_preprint)
-    scored["verificationSources"] = provenance_chain
-    scored["notes"] = notes
-    scored["manualCheckRequired"] = bool(manual_check_reasons)
-    scored["manualCheckReasons"] = manual_check_reasons
-    scored["googleScholarSearchUrl"] = result["googleScholarSearchUrl"]
-    scored["verificationStatus"] = (
-        "verified-doi"
-        if scored.get("doi")
-        else "trusted-bibtex-no-doi"
-        if bibtex and scored.get("reliableBibtexSource")
-        else "unverified"
-    )
-
-    if bibtex:
-        landing_url = (
-            f"https://doi.org/{scored['doi']}"
-            if scored.get("doi")
-            else str(scored.get("dblpUrl", "") or scored.get("sourceUrl", ""))
-        )
-        provenance_fields = {
-            "x-bib-source": scored["source"],
-            "x-bib-source-url": scored["sourceUrl"],
+    if scored["metadataVerified"] and bib_source != "local-bib":
+        scored["bibtex"] = append_provenance_fields(bibtex, {
+            "x-bib-source": bib_source, "x-bib-source-url": bib_url,
             "x-verified-with": ",".join(scored["verificationSources"]),
-            "x-verified-at": current_date_iso(),
-            "x-quality-score": str(scored["qualityScore"]),
-            "x-verification-status": str(scored["verificationStatus"]),
-        }
-        if landing_url:
-            provenance_fields["url"] = landing_url
-        if scored.get("manualCheckRequired"):
-            provenance_fields["x-secondary-check-required"] = "true"
-        bibtex = append_provenance_fields(
-            bibtex,
-            provenance_fields,
-        )
-    else:
-        scored["eligible"] = False
-        scored.setdefault("rejectionReasons", []).append("bibtex-download-failed")
-    scored["bibtex"] = bibtex
+            "x-verified-at": scored["verifiedAt"], "x-quality-score": str(scored["qualityScore"]),
+            "x-verification-status": scored["verificationStatus"],
+            "x-verification-schema": str(SCHEMA_VERSION),
+            "x-verification-scope": "bibliographic-metadata",
+            "x-claim-support-status": "not-reviewed",
+        })
     return scored
 
 
@@ -1792,29 +1533,24 @@ def resolve_project_root(args: argparse.Namespace, bib_paths: list[Path]) -> Pat
 
 
 def render_markdown(report: list[dict[str, Any]], top: int) -> str:
-    lines: list[str] = []
+    lines = []
     for item in report:
         lines.append(f"## Claim\n{item['query']}\n")
-        if item.get("googleScholarSearchUrl"):
-            lines.append(f"Scholar hint: {item['googleScholarSearchUrl']}\n")
         results = item["results"][:top] if top > 0 else item["results"]
         if not results:
-            lines.append("No verified candidates are ready yet.\n")
-            continue
-        for index, result in enumerate(results, start=1):
-            lines.append(
-                f"{index}. {result['title']} ({result.get('year', 'unknown')})"
-                f" | venue: {result.get('venue', 'unknown')}"
-                f" | doi: {result.get('doi', 'missing')}"
-                f" | status: {result.get('verificationStatus', 'unknown')}"
-                f" | bib-source: {result.get('source', 'unknown')}"
-                f" | score: {result.get('qualityScore', 'n/a')}"
-            )
-            if result.get("manualCheckRequired"):
-                reason_text = "; ".join(str(reason) for reason in result.get("manualCheckReasons", [])) or "manual second check required"
-                lines.append(f"   manual check: {reason_text}")
-                if result.get("googleScholarSearchUrl"):
-                    lines.append(f"   scholar hint: {result['googleScholarSearchUrl']}")
+            lines.append("No candidates passed the bibliographic metadata checks.\n")
+        for result in results:
+            lines.append(f"- {result['title']} ({result.get('year', 'unknown')}) | {result.get('venue', 'unknown')} | DOI: {result.get('doi') or 'not found'} | {result['verificationStatus']}")
+            lines.append(f"  Claim support: {result.get('claimSupport', {}).get('status', 'not-reviewed')}; score is heuristic.")
+        for result in item.get("reviewRequired", []):
+            lines.append(f"- Review required: {result.get('title', 'unknown')} | {result.get('verificationStatus')}")
+            for field in result.get("unresolvedFields", []):
+                check = result["fieldChecks"][field]
+                lines.append(f"  {field}: {check['status']} — {check['reason']}")
+                for observed in check.get("observations", []):
+                    lines.append(f"    {observed['source']}: {observed['value']} ({observed['sourceUrl']})")
+                for difference in check.get("differences", []):
+                    lines.append(f"    {difference['field']}: record={difference['selectedValue']!r}; BibTeX={difference['bibtexValue']!r}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -2084,6 +1820,7 @@ def main() -> int:
             except OSError as exc:
                 print(f"Failed to store Semantic Scholar API key: {exc}", file=sys.stderr)
         verified_results = []
+        attempts = []
         for candidate_index, candidate in enumerate(candidates, start=1):
             PROGRESS_TRACKER.update(
                 current_query=query_index,
@@ -2094,7 +1831,7 @@ def main() -> int:
             try:
                 if (
                     candidate.get("candidateSource") in LOCAL_REUSE_SOURCES
-                    and candidate.get("checked")
+                    and infer_local_checked_status(candidate)
                     and candidate.get("bibtex")
                 ):
                     verified = build_scored_local_result(
@@ -2115,7 +1852,10 @@ def main() -> int:
                         allow_preprint=args.allow_preprint,
                         venue_hints=venue_hints,
                     )
+                attempts.append(verified)
                 verified_results.append(verified)
+                update_ledger_entry(ledger, verified)
+                update_user_library_entry(user_library, verified, project_root=project_root)
             except FetchError as exc:
                 if PROGRESS_TRACKER is not None:
                     PROGRESS_TRACKER.update(
@@ -2154,6 +1894,7 @@ def main() -> int:
                 "query": query,
                 "googleScholarSearchUrl": google_scholar_search_url(query),
                 "results": verified_results,
+                "reviewRequired": [item for item in attempts if not item.get("metadataVerified")],
             }
         )
         PROGRESS_TRACKER.update(

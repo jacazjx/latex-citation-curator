@@ -39,7 +39,7 @@ For a Chinese-language citation gap:
 2. Search Semantic Scholar and OpenAlex when the topic may have English or DOI-bearing records.
 3. Search CNKI with Chinese terms and, when needed, CSSCI/CSCD/北大核心 filters.
 4. Verify DOI-bearing candidates with Crossref, DOI resolution, publisher metadata, or other DOI-aware sources.
-5. Use CNKI export metadata for no-DOI Chinese formal publications, with manual second-check marking.
+5. For no-DOI formal publications, retain actual CNKI export metadata and require the shared cross-source field checks before marking verified. CNKI plus its own export is only one family.
 
 ## Search strategy
 
@@ -166,17 +166,19 @@ When export metadata is used, record provenance fields such as:
 x-bib-source = {cnki-export}
 x-bib-source-url = {https://kns.cnki.net/...}
 x-verified-with = {cnki}
-x-verification-status = {trusted-bibtex-no-doi}
+x-verification-status = {pending-verification}
 x-secondary-check-required = {true}
 ```
 
-If a DOI is present in the CNKI export, verify it separately before setting `x-verification-status = {verified-doi}`.
+If an export supplies DOI, verify its resolution, returned metadata and actual output against other sources before `verified-doi`. With no DOI found, use `verified-metadata-no-doi` only after all required checks pass. Export availability alone is not enough.
+
+The fetcher has no automatic CNKI ingestion. Preserve source observations and export content using the schema in [source-verification.md](source-verification.md). The shared checker, also used by `score_papers.py`, must determine status; do not hand-assign passing labels.
 
 ## Verification and ranking rules
 
 Use CNKI evidence this way:
 
-- Treat CNKI as strong evidence that a Chinese-language formal publication exists when the detail page and export metadata align.
+- Matching CNKI detail/export data supports a formal record but remains one source family. Required fields need another agreeing family; missing or conflicting fields remain explicit and the entry stays outside verified bibliography.
 - Treat CNKI source-category filters as venue-quality hints only when explicitly observed.
 - Treat CNKI citation/download counts as weak ranking features; direct claim fit, publication status, DOI verification, and venue/source quality matter more.
 - Prefer a DOI-verified formal record over a CNKI-only no-DOI record when both support the claim equally well.
@@ -185,7 +187,7 @@ Use CNKI evidence this way:
 For final output, include a caveat for CNKI-only entries:
 
 ```text
-CNKI metadata was used as the trusted bibliography source; no DOI was verified, so this entry is marked for manual second checking.
+CNKI supplied the bibliography. No DOI was verified. Report the actual field checks and unresolved fields; keep the entry pending unless another source family confirms the required metadata.
 ```
 
 ## Access and captcha handling

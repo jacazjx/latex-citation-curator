@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 
-SCRIPTS_DIR = Path("/mnt/d/Jacazjx/Documents/Playground/latex-citation-curator/scripts")
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 SPEC = importlib.util.spec_from_file_location("fetch_verified_bibtex", SCRIPTS_DIR / "fetch_verified_bibtex.py")

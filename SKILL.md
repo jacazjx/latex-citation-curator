@@ -9,6 +9,10 @@ description: find, verify, rank, and generate doi-verified or trusted-source bib
 
 Find citation gaps in LaTeX drafts, retrieve real candidate papers, rank them with a repeatable quality formula, and produce provenance-aware BibTeX entries.
 
+Only mark bibliographic metadata verified when the shared field checker actually passes. A DOI string, provider name, old status, date or score is not verification. Read [references/source-verification.md](references/source-verification.md) before finalizing or reusing citations; it defines the checks, statuses and report schema.
+
+Keep metadata verification separate from claim support. The fetcher sets claim support to `not-reviewed`; read the relevant paper content before recommending it as support.
+
 Use this skill to support claims, not to pad a bibliography. Prefer fewer well-matched papers over many weak ones.
 
 Create and maintain a project-local hidden state directory at `.latex-citation-curator/`. Use it to track whether BibTeX entries have already been checked, what verification status they reached, and which `.bib` files they were synced from.
@@ -87,7 +91,7 @@ Use this source order:
 4. CNKI for Chinese-language scholarship, Chinese journals, CSSCI/CSCD/北大核心 filtering, GB/T 7714/EndNote metadata, and Chinese abstracts or keywords
 5. Google Scholar only as a manual hint source when DOI discovery fails or metadata is sparse
 
-Before remote discovery, scan the local `.bib` files, the project ledger, and the user-level paper library. If a matching entry was already checked, reuse it first instead of re-fetching metadata.
+Before remote discovery, scan the local `.bib` files, the project ledger, and the user-level paper library. If a matching entry has schema-version-2 field evidence, rerun the checker against stored observations and current BibTeX before reuse. Legacy labels alone require new verification. The fetcher still performs remote discovery; reuse skips re-verification of passing cached entries, not necessarily all network calls.
 
 If the shared Semantic Scholar pool returns rate limits:
 
@@ -108,7 +112,11 @@ Always collect:
 - source URL
 - BibTeX, EndNote, RIS, or GB/T 7714 source URL/provider when available
 
-Read [references/source-verification.md](references/source-verification.md) when you need the exact verification checklist or BibTeX provenance rules.
+Preserve each source's original values before merging. Check title, complete ordered authors, year, venue, formal-publication status, DOI when present, supplied volume/issue/pages/article number, and actual BibTeX. Do not silently replace disagreeing values.
+
+Every required metadata field needs matching observations from at least two distinct source families. Crossref and DOI content negotiation count as one family; CNKI and its export also count as one. For DOI-bearing papers, download the DOI bibliography and compare its DOI and paper fields. Missing exports and source failures cannot pass.
+
+Use [references/source-verification.md](references/source-verification.md) for the exact checks and state schema.
 
 Read [references/cnki-workflow.md](references/cnki-workflow.md) when the task needs CNKI search, CNKI metadata extraction, CNKI source-category filters, or Chinese citation export handling.
 
@@ -120,13 +128,13 @@ If a preprint has a formally published version:
 
 - Cite the formal version
 - Use the formal DOI when one exists
-- If the formal version has no DOI, fetch BibTeX from DBLP, CNKI export metadata, or another reliable provider and mark the entry for manual second checking
+- If no DOI is found for the formal version, fetch a trusted export and apply the same field checks; the export alone remains pending
 - Prefer publisher or Crossref metadata over preprint metadata
 - Keep the preprint only as a search breadcrumb in your notes, not in the final bibliography
 
 If you cannot prove that a formal version exists, say so explicitly.
 
-For Chinese journal articles with no DOI, treat CNKI as discovery and metadata evidence. Do not call the result DOI-verified. Emit a trusted-source entry only when the CNKI record is coherent, the journal/source is formal, and the citation metadata came from CNKI export or another trusted provider.
+For Chinese articles with no DOI found, CNKI plus its own export is one source family. Keep the entry pending until required cross-source checks pass; then use `verified-metadata-no-doi`, never `verified-doi`. CNKI remains browser assisted, not a fetch-script integration.
 
 ### 6. Rank candidates with a repeatable score
 
@@ -143,6 +151,8 @@ Use `scripts/score_papers.py` when you already have candidate metadata in JSON o
 - publication bonus
 - rejection reasons
 
+The fetcher's relevance/evidence values are title/abstract/keyword heuristics. They do not verify experiments, theory or claim support. Keep `claimSupport.status = not-reviewed` until the relevant content is read and its location, supporting result, conditions and reviewer are recorded separately.
+
 Treat the score as a ranking aid, not as proof. A lower-scoring paper that directly supports the claim can beat a higher-scoring but weakly related paper.
 
 Apply a minimum relevance gate before delivery. If no candidate clears the gate, return no final citation rather than a weakly related paper.
@@ -151,7 +161,9 @@ For CNKI candidates, use CSSCI, CSCD, 北大核心, SCI, or EI source-category e
 
 ### 7. Produce verified output
 
-For each accepted citation, provide:
+Only entries passing all required field checks may enter verified bibliography. Passing states are `verified-doi` and `verified-metadata-no-doi`; other states are `pending-verification`, `metadata-conflict`, or `verification-failed`. The old `trusted-bibtex-no-doi` label does not establish verification.
+
+For each metadata-verified entry, provide:
 
 - the claim being supported
 - 1 to 3 recommended papers ranked by fit
@@ -159,7 +171,9 @@ For each accepted citation, provide:
 - venue and year
 - a brief explanation of why the paper supports the claim
 - any caveat, such as the paper being older but seminal or CNKI-only metadata requiring manual second check
-- a manual-check note when the final BibTeX came from a trusted provider without a DOI
+- whether claim support was actually reviewed, separately from metadata verification
+
+For each attempted entry that did not pass, retain `fieldChecks`, `metadataObservations` with URLs and original values, `unresolvedFields`, and fetch errors. Show unresolved fields and reasons in the report; exclude these entries from verified `.bib` output instead of silently filtering them away.
 
 When generating BibTeX, include provenance fields such as:
 
@@ -172,15 +186,19 @@ When generating BibTeX, include provenance fields such as:
 - `x-quality-score`
 - `x-verification-status`
 - `x-secondary-check-required`
+- `x-verification-schema`
+- `x-verification-scope`
+- `x-claim-support-status`
 
 Do not fabricate missing BibTeX fields. If the source record is incomplete, say what is missing.
 
 After every run:
 
-- sync accepted citations back into `.latex-citation-curator/verification-ledger.json`
-- sync accepted citations into the user-level paper library
+- sync attempted citations and their checks, including failures, into `.latex-citation-curator/verification-ledger.json`
+- sync those records into the user-level paper library
 - if a target `.bib` file was provided, sync the ledger with that `.bib` file again
 - keep user-edited BibTeX entries intact; use the ledger to store extra verification state instead of overwriting manual edits
+- re-evaluate current `.bib` content against stored evidence; edits or failed rechecks revoke passing status in both stores
 
 ## Hard Rules
 
@@ -190,11 +208,13 @@ After every run:
 - Do not bypass CNKI login, paywalls, download restrictions, or captchas. If CNKI shows a visible captcha, pause and ask the user to complete it manually.
 - Do not keep a preprint in the final bibliography when a verified formal publication exists.
 - If a formal version has a DOI, verify and use it.
-- If a formal version has no DOI, only emit BibTeX from a trusted provider such as DBLP, CNKI export metadata, or another reliable source and mark the result for manual second checking.
+- With no DOI found, require a trusted export and passing field checks before emitting verified BibTeX; pending/conflicting entries remain in reports only.
 - Do not use Google Scholar as an automated metadata or BibTeX source.
 - Do not overwrite user-authored `.bib` entries just to inject verification metadata. Store extra state in the project ledger unless the user explicitly asks for BibTeX rewrites.
 - Do not guess CCF tier, JCR quartile, CSSCI, CSCD, or 北大核心 status. Mark them as unknown when you cannot verify them.
 - Do not hide uncertainty. Surface disagreements between DBLP, Crossref, Semantic Scholar, OpenAlex, CNKI, and publisher pages.
+- Never infer verification from a DOI, old `checked` flag, date, manual-check marker or score. Use actual observations and output BibTeX.
+- Do not equate bibliographic verification with support for a manuscript claim.
 
 ## Local Helpers
 
@@ -218,7 +238,7 @@ Example:
 python3 scripts/score_papers.py candidates.json --format tsv
 ```
 
-Each candidate record may contain:
+Ranking inputs may contain the following fields. Without actual verification observations they can be ranked, but cannot become eligible for verified bibliography:
 
 - `title`
 - `year`
@@ -238,6 +258,8 @@ Each candidate record may contain:
 - `reliableBibtexSource`
 - `manualCheckRequired`
 
+Verified eligibility also needs source observations, DOI resolution when applicable, actual BibTeX and parsed output metadata. See [references/source-verification.md](references/source-verification.md).
+
 ### `scripts/fetch_verified_bibtex.py`
 
 Run this when you need an end-to-end verified citation workflow with live metadata sources.
@@ -251,21 +273,22 @@ It prefers a Semantic Scholar API key when available and will:
 - replace preprints with verified formal versions when found
 - fall back to DBLP BibTeX for formal versions that have no DOI
 - score the surviving candidates
-- emit DOI-verified or trusted-source BibTeX with provenance fields
+- compare actual source values and BibTeX, then emit only metadata-verified entries
+- retain pending/failed records in `reviewRequired` with original values and reasons
 
 The script also:
 
 - creates and maintains `.latex-citation-curator/verification-ledger.json` in the project root
 - creates and maintains a user-level `paper-library.json` in the cache directory for cross-project reuse
 - scans `--existing-bib`, `--append-bib`, and existing `--write-bib` targets before remote discovery
-- prioritizes previously checked local BibTeX, project-ledger entries, and user-library entries before remote metadata lookups
+- loads local entries first and reruns stored field checks before reusing a verified entry
 - prompts once in interactive terminals to ask whether the user has a Semantic Scholar API key
 - continues in free shared mode when the user does not have a key
 - falls back to the shared Semantic Scholar channel when authenticated access is refused
 - uses long backoff for shared-channel rate limits
 - stores successful network responses in a persistent local cache file
 - stores processed BibTeX and metadata in a persistent user-level paper library
-- prints a progress box to stderr without mixing failed attempts into the final result set
+- sends transient network progress to stderr while retaining unresolved candidate checks in reports and state
 - emits Google Scholar query links only as manual review hints, not as scraped metadata
 
 The script first checks `--semantic-scholar-api-key`, then `SEMANTIC_SCHOLAR_API_KEY`, then the persisted local secret file.
@@ -273,6 +296,8 @@ The script first checks `--semantic-scholar-api-key`, then `SEMANTIC_SCHOLAR_API
 Use `--no-key-prompt` in non-interactive wrappers when you want the script to skip the terminal prompt and proceed directly with stored or shared mode.
 
 Use `--existing-bib refs.bib` to make the script inspect an existing bibliography first. Use `--project-root /path/to/project` to control where `.latex-citation-curator/` is created.
+
+`--write-bib` writes/replaces its output path; use a separate new file unless replacement was requested. `--append-bib` preserves existing entries and appends passing new entries.
 
 Examples:
 
